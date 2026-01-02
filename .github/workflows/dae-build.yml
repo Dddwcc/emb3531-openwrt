@@ -1,4 +1,4 @@
-name: EMB-3531-DAE-Final-Build
+name: EMB-3531-DAE-Final
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
     - name: 1. 检出代码
       uses: actions/checkout@v3
 
-    - name: 2. 准备编译环境
+    - name: 2. 安装编译环境
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
@@ -27,7 +27,7 @@ jobs:
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
 
-    - name: 3. 克隆源码与插件
+    - name: 3. 下载源码与插件
       run: |
         git clone $REPO_URL -b $REPO_BRANCH openwrt
         cd openwrt
@@ -36,28 +36,28 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: 4. 写入旁路由配置
+    - name: 4. 修改配置 (旁路由+dae+BTF)
       run: |
         cd openwrt
-        # 硬件 RK3399
+        # 硬件型号 RK3399
         echo "CONFIG_TARGET_rockchip=y" >> .config
         echo "CONFIG_TARGET_rockchip_armv8=y" >> .config
         echo "CONFIG_TARGET_rockchip_armv8_DEVICE_firefly_rk3399=y" >> .config
         
-        # dae + mosdns
+        # 核心插件
         echo "CONFIG_PACKAGE_luci-app-daed=y" >> .config
         echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
         echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
         
-        # 内核支持
+        # 内核 BTF 支持 (dae 运行必备)
         echo "CONFIG_KERNEL_BPF_EVENTS=y" >> .config
         echo "CONFIG_KERNEL_DEBUG_INFO=y" >> .config
         echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
         echo "CONFIG_BPF_SYSCALL=y" >> .config
 
-        # 预设旁路由 IP (192.168.1.88)
+        # 旁路由自动化设置 (IP: 192.168.1.88)
         mkdir -p package/base-files/files/etc/uci-defaults
-        cat > package/base-files/files/etc/uci-defaults/99-custom-setup <<EOF
+        cat > package/base-files/files/etc/uci-defaults/99-setup <<EOF
         uci set network.lan.proto='static'
         uci set network.lan.ipaddr='192.168.1.88'
         uci set network.lan.netmask='255.255.255.0'
@@ -66,7 +66,7 @@ jobs:
         uci set dhcp.lan.ignore='1'
         uci commit
         EOF
-        
+
         make defconfig
 
     - name: 5. 下载软件包
@@ -74,25 +74,25 @@ jobs:
         cd openwrt
         make download -j8
 
-    - name: 6. 运行编译
+    - name: 6. 开始编译
       id: compile
       run: |
         cd openwrt
         make -j$(nproc) || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: 7. 整理固件文件
+    - name: 7. 整理固件
       if: steps.compile.outputs.status == 'success'
       run: |
-        cd openwrt/bin/targets/*/*
+        cd openwrt/bin/targets/rockchip/armv8
         rm -rf packages
         echo "FIRMWARE_DIR=$PWD" >> $GITHUB_ENV
 
-    - name: 8. 上传固件到 Release
+    - name: 8. 发布到 Release
       uses: softprops/action-gh-release@v1
       if: env.FIRMWARE_DIR != ''
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: Build-${{ github.run_id }}
+        tag_name: EMB-3531-${{ github.run_id }}
         files: ${{ env.FIRMWARE_DIR }}/*
