@@ -1,4 +1,4 @@
-name: EMB-3531-Final-Build
+name: EMB-3531-DAE-SideRouter-Final
 
 on:
   workflow_dispatch:
@@ -18,72 +18,76 @@ jobs:
       - name: 1. 检出代码
         uses: actions/checkout@v3
 
-      - name: 2. 清理磁盘并安装依赖
+      - name: 2. 安装环境与BTF工具
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup
-          sudo docker image prune -a -f
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo -E apt-get -qq update
           sudo -E apt-get -qq install $(curl -fsSL https://is.gd/depends_ubuntu_2204) dwarves clang llvm
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
           sudo timedatectl set-timezone "$TZ"
 
-      - name: 3. 克隆源码与插件处理
+      - name: 3. 克隆源码并清洗冲突
         run: |
           git clone $REPO_URL -b $REPO_BRANCH openwrt
           cd openwrt
           echo "src-git kenzo https://github.com/kenzok8/openwrt-packages" >> feeds.conf.default
           echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
           ./scripts/feeds update -a
+          # 彻底清除重复包防止 Error 2
           rm -rf feeds/luci/applications/luci-app-mosdns
           rm -rf feeds/packages/net/mosdns
           rm -rf feeds/luci/themes/luci-theme-argon
           ./scripts/feeds install -a
 
-      - name: 4. 自动注入补丁与设备树 (PCIe超时 & 硬件引脚适配)
+      - name: 4. 修改内核源码 (强制解决PCIe超时)
         run: |
           cd openwrt
-          mkdir -p target/linux/rockchip/patches-6.1/
-          # 创建PCIe超时补丁 (1500ms)
-          cat > target/linux/rockchip/patches-6.1/999-pcie-timeout-fix.patch <<EOF
-          --- a/drivers/pci/controller/pcie-rockchip-host.c
-          +++ b/drivers/pci/controller/pcie-rockchip-host.c
-          @@ -336,7 +336,7 @@ static int rockchip_pcie_host_init_port(
-           	/* 500ms timeout value should be enough for Gen1/2 training */
-           	err = readl_poll_timeout(rockchip->apb_base + PCIE_CLIENT_BASIC_STATUS1,
-           				 status, PCIE_LINK_UP(status), 20,
-          -				 500 * USEC_PER_MSEC);
-          +				 1500 * USEC_PER_MSEC);
-           	if (err) {
-           		dev_err(dev, "PCIe link training gen1 timeout!\n");
-           		goto err_power_off_phy;
-          EOF
+          # 直接修改内核驱动源码，将 500ms 超时改为 2000ms，这是解决识别不到网卡的命门
+          find target/linux/rockchip -name "pcie-rockchip-host.c" -exec sed -i 's/500 \* USEC_PER_MSEC/2000 \* USEC_PER_MSEC/g' {} +
+          # 针对某些内核版本中定义的宏名进行替换
+          find target/linux/rockchip -name "pcie-rockchip-host.c" -exec sed -i 's/RK_PCIE_LINK_UP_TIMEOUT_MS	500/RK_PCIE_LINK_UP_TIMEOUT_MS	2000/g' {} +
 
-          # 创建EMB-3531专用的设备树文件 (基于你提供的 rockchip.dts 核心定义)
+      - name: 5. 注入EMB-3531专有设备树
+        run: |
+          cd openwrt
+          # 创建独立的 DTS 文件
           cat > target/linux/rockchip/dts/rockchip/rk3399-emb-3531.dts <<EOF
           /dts-v1/;
           #include "rk3399-nanopi-r4s.dts"
           / {
               model = "Norco EMB-3531 Board";
               compatible = "rockchip,rk3399-emb-3531", "rockchip,rk3399";
+              
+              /* 强制定义PCIe供电调节器，解决日志中的 regulator found 报错 */
+              vcc3v3_pcie: vcc3v3-pcie-regulator {
+                  compatible = "regulator-fixed";
+                  enable-active-high;
+                  gpio = <&gpio1 17 0>; /* GPIO1_C1 = 编号49 (1*32 + 17) */
+                  pinctrl-names = "default";
+                  pinctrl-0 = <&pcie_pwr_en>;
+                  regulator-name = "vcc3v3_pcie";
+                  regulator-always-on;
+                  regulator-boot-on;
+              };
           };
           &pcie0 {
-              ep-gpios = <&gpio4 0x19 0x00>;
+              ep-gpios = <&gpio4 25 0>; /* GPIO4_D1 = 编号153 (4*32+25) */
               vpcie3v3-supply = <&vcc3v3_pcie>;
               status = "okay";
           };
           &pinctrl {
               pcie {
-                  vcc3v3_pcie_en: vcc3v3-pcie-en {
-                      rockchip,pins = <1 0x11 0x00 0xba>;
+                  pcie_pwr_en: pcie-pwr-en {
+                      rockchip,pins = <1 17 0 &pcfg_pull_none>;
                   };
               };
           };
           EOF
-          # 注册这个新设备树
+          # 将新设备树注册进编译列表
           sed -i '/rk3399-nanopi-r4s/a \	rk3399-emb-3531.dtb \\' target/linux/rockchip/image/armv8.mk
 
-      - name: 5. 注入旁路由配置 (IP: 1.88 / No DHCP)
+      - name: 6. 旁路由自动化预设 (IP 1.88 / 关闭DHCP)
         run: |
           cd openwrt
           mkdir -p package/base-files/files/etc/uci-defaults
@@ -98,7 +102,7 @@ jobs:
           uci commit
           EOF
 
-      - name: 6. 核心配置与 dae 支持
+      - name: 7. 写入最终配置 (.config)
         run: |
           cd openwrt
           echo "CONFIG_TARGET_rockchip=y" >> .config
@@ -107,17 +111,18 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-daed=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
           echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+          # dae 必须的内核选项
+          echo "CONFIG_KERNEL_DEBUG_INFO=y" >> .config
           echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
+          echo "CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y" >> .config
           echo "CONFIG_BPF_SYSCALL=y" >> .config
           make defconfig
 
-      - name: 7. 下载软件包
-        run: cd openwrt && make download -j8
-
-      - name: 8. 编译
+      - name: 8. 执行编译
         id: compile
         run: |
           cd openwrt
+          make download -j8
           make -j$(nproc) || make -j1 V=s
           echo "status=success" >> $GITHUB_OUTPUT
 
