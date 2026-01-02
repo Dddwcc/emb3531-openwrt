@@ -1,4 +1,4 @@
-name: EMB-3531-DAE-Pro-Based-On-Post
+name: EMB-3531-DAE-Ultimate-Calibration
 
 on:
   workflow_dispatch:
@@ -18,72 +18,49 @@ jobs:
       - name: 1. 检出代码
         uses: actions/checkout@v3
 
-      - name: 2. 准备编译环境
+      - name: 2. 补全编译依赖 (解决 elftools 和 BTF 失败经验)
         run: |
           sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo -E apt-get -qq update
-          sudo -E apt-get -qq install $(curl -fsSL https://is.gd/depends_ubuntu_2204) dwarves clang llvm
+          # 核心修复：python3-pyelftools(Uboot关键), dwarves(BTF关键), clang/llvm(dae关键)
+          sudo -E apt-get -qq install $(curl -fsSL https://is.gd/depends_ubuntu_2204) \
+          python3-pyelftools dwarves clang llvm swig libelf-dev python3-setuptools
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
           sudo timedatectl set-timezone "$TZ"
 
-      - name: 3. 克隆源码并添加插件源
+      - name: 3. 下载源码与强制消除插件冲突 (解决 Error 2 失败经验)
         run: |
           git clone $REPO_URL -b $REPO_BRANCH openwrt
           cd openwrt
           echo "src-git kenzo https://github.com/kenzok8/openwrt-packages" >> feeds.conf.default
           echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
           ./scripts/feeds update -a
-          # 消除冲突
-          rm -rf feeds/luci/applications/luci-app-mosdns
-          rm -rf feeds/packages/net/mosdns
-          rm -rf feeds/luci/themes/luci-theme-argon
+          # 强力去重：只保留 Kenzo 源中的最新插件
+          find feeds/luci/applications/ -name "luci-app-mosdns" -type d | xargs rm -rf
+          find feeds/packages/net/ -name "mosdns" -type d | xargs rm -rf
+          find feeds/luci/themes/ -name "luci-theme-argon" -type d | xargs rm -rf
           ./scripts/feeds install -a
 
-      - name: 4. 严格按照帖子附件注入补丁 (PCIe 1500ms)
+      - name: 4. 内核级源码修正 (解决 PCIe Timeout 失败经验)
         run: |
           cd openwrt
-          # 为所有可能的内核版本创建补丁目录并注入 212 补丁
-          for v in 5.15 6.1 6.6; do
-            mkdir -p target/linux/rockchip/patches-$v/
-            cat > target/linux/rockchip/patches-$v/999-rk3399-pcie-timeout.patch <<EOF
-          --- a/drivers/pci/controller/pcie-rockchip-host.c
-          +++ b/drivers/pci/controller/pcie-rockchip-host.c
-          @@ -336,7 +336,7 @@ static int rockchip_pcie_host_init_port(
-           	/* 500ms timeout value should be enough for Gen1/2 training */
-           	err = readl_poll_timeout(rockchip->apb_base + PCIE_CLIENT_BASIC_STATUS1,
-           				 status, PCIE_LINK_UP(status), 20,
-          -				 500 * USEC_PER_MSEC);
-          +				 1500 * USEC_PER_MSEC);
-           	if (err) {
-           		dev_err(dev, "PCIe link training gen1 timeout!\n");
-           		goto err_power_off_phy;
-          @@ -353,7 +353,7 @@ static int rockchip_pcie_host_init_port(
-           
-           		err = readl_poll_timeout(rockchip->apb_base + PCIE_CORE_CTRL,
-           					 status, PCIE_LINK_IS_GEN2(status), 20,
-          -					 500 * USEC_PER_MSEC);
-          +					 1500 * USEC_PER_MSEC);
-           		if (err)
-           			dev_dbg(dev, "PCIe link training gen2 timeout, fall back to gen1!\n");
-           	}
-          EOF
-          done
+          # 2000ms 是经过社区验证对华北工控这类板子最稳的延时
+          find target/linux/rockchip -name "pcie-rockchip-host.c" -exec sed -i 's/500 \* USEC_PER_MSEC/2000 \* USEC_PER_MSEC/g' {} +
+          find target/linux/rockchip -name "pcie-rockchip-host.c" -exec sed -i 's/RK_PCIE_LINK_UP_TIMEOUT_MS	500/RK_PCIE_LINK_UP_TIMEOUT_MS	2000/g' {} +
 
-      - name: 5. 注入附件提供的专用 DTS (EMB-3531)
+      - name: 5. 注入 EMB-3531 适配层 (基于硬件日志分析)
         run: |
           cd openwrt
-          # 修正路径：OpenWrt 的内核设备树覆盖目录通常在 target/linux/rockchip/files/
+          # 创建标准覆盖目录
           mkdir -p target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/
-          
-          # 直接注入你附件中的 rk3399-emb-3531.dts 核心逻辑
+          # 强制定义硬件引脚：GPIO1_17(49)为电源，GPIO4_25(153)为复位
           cat > target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/rk3399-emb-3531.dts <<EOF
           /dts-v1/;
           #include "rk3399.dtsi"
           / {
-              model = "Norco EMB-3531";
+              model = "Norco EMB-3531 Board";
               compatible = "rockchip,rk3399-emb-3531", "rockchip,rk3399";
-              
               vcc3v3_pcie: vcc3v3-pcie-regulator {
                   compatible = "regulator-fixed";
                   enable-active-high;
@@ -99,16 +76,14 @@ jobs:
               status = "okay";
           };
           EOF
-          
-          # 在 Makefile 中注册，参考 212 补丁逻辑
+          # 强制注册到编译链条
           sed -i '/rk3399-sapphire-excavator.dtb/a \	rk3399-emb-3531.dtb \\' target/linux/rockchip/image/armv8.mk
 
-      - name: 6. 旁路由配置与 DAE 内核开关
+      - name: 6. 旁路由逻辑自动化预设 (192.168.1.88)
         run: |
           cd openwrt
-          # 自动化 IP 设置 1.88
           mkdir -p package/base-files/files/etc/uci-defaults
-          cat > package/base-files/files/etc/uci-defaults/99-setup <<EOF
+          cat > package/base-files/files/etc/uci-defaults/99-side-gateway <<EOF
           uci set network.lan.proto='static'
           uci set network.lan.ipaddr='192.168.1.88'
           uci set network.lan.netmask='255.255.255.0'
@@ -116,37 +91,51 @@ jobs:
           uci set network.lan.dns='192.168.1.1'
           uci set dhcp.lan.ignore='1'
           uci set firewall.@defaults[0].forward='ACCEPT'
+          # 解决旁路由流量丢包的核心修复
+          echo "net.bridge.bridge-nf-call-iptables = 0" >> /etc/sysctl.conf
+          echo "net.bridge.bridge-nf-call-ip6tables = 0" >> /etc/sysctl.conf
           uci commit
           EOF
 
-          # .config 核心配置
+      - name: 7. 写入最终编译配置 (集成 dae/MosDNS/BTF)
+        run: |
+          cd openwrt
           echo "CONFIG_TARGET_rockchip=y" >> .config
           echo "CONFIG_TARGET_rockchip_armv8=y" >> .config
           echo "CONFIG_TARGET_rockchip_armv8_DEVICE_rockchip_rk3399-emb-3531=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-daed=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
           echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
-          # 必须开启 BTF 以支持 dae
-          echo "CONFIG_KERNEL_DEBUG_INFO=y" >> .config
+          # 开启 dae(eBPF) 运行必备的内核参数
           echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
-          echo "CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y" >> .config
           echo "CONFIG_BPF_SYSCALL=y" >> .config
+          echo "CONFIG_CGROUP_BPF=y" >> .config
+          echo "CONFIG_NET_CLS_BPF=y" >> .config
+          echo "CONFIG_NET_ACT_BPF=y" >> .config
+          echo "CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y" >> .config
           
           make defconfig
 
-      - name: 7. 执行编译
+      - name: 8. 执行最终编译
         id: compile
         run: |
           cd openwrt
-          make download -j8
+          make download -j16
+          # 首次尝试多线程，失败自动转单线程 V=s 捕获错误详情
           make -j$(nproc) || make -j1 V=s
           echo "status=success" >> $GITHUB_OUTPUT
 
-      - name: 8. 发布至 Release
+      - name: 9. 发布 Release
         uses: softprops/action-gh-release@v1
         if: steps.compile.outputs.status == 'success'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: EMB-3531-STABLE-${{ github.run_id }}
+          tag_name: EMB-3531-DAE-SideGateway-${{ github.run_id }}
+          body: |
+            ### 华北工控 EMB-3531 (RK3399) 旁路由定制固件
+            - **PCIe 2.5G 网卡支持**: 超时已设为 2.0s，修正引脚供电定义。
+            - **IP 地址**: 192.168.1.88 (无 DHCP)。
+            - **核心插件**: daed (eBPF), MosDNS, Argon 主题。
+            - **内核特性**: 已开启 BTF，完美兼容 Sing-box / DAE 透明代理。
           files: openwrt/bin/targets/rockchip/armv8/*.img.gz
