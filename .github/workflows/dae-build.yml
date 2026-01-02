@@ -1,0 +1,98 @@
+name: EMB-3531-DAE-Final-Build
+
+on:
+  workflow_dispatch:
+
+permissions: write-all
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: 1. 检出代码
+      uses: actions/checkout@v3
+
+    - name: 2. 准备编译环境
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install $(curl -fsSL https://is.gd/depends_ubuntu_2204) dwarves
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+
+    - name: 3. 克隆源码与插件
+      run: |
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        cd openwrt
+        echo "src-git kenzo https://github.com/kenzok8/openwrt-packages" >> feeds.conf.default
+        echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: 4. 写入旁路由配置
+      run: |
+        cd openwrt
+        # 硬件 RK3399
+        echo "CONFIG_TARGET_rockchip=y" >> .config
+        echo "CONFIG_TARGET_rockchip_armv8=y" >> .config
+        echo "CONFIG_TARGET_rockchip_armv8_DEVICE_firefly_rk3399=y" >> .config
+        
+        # dae + mosdns
+        echo "CONFIG_PACKAGE_luci-app-daed=y" >> .config
+        echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
+        echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+        
+        # 内核支持
+        echo "CONFIG_KERNEL_BPF_EVENTS=y" >> .config
+        echo "CONFIG_KERNEL_DEBUG_INFO=y" >> .config
+        echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
+        echo "CONFIG_BPF_SYSCALL=y" >> .config
+
+        # 预设旁路由 IP (192.168.1.88)
+        mkdir -p package/base-files/files/etc/uci-defaults
+        cat > package/base-files/files/etc/uci-defaults/99-custom-setup <<EOF
+        uci set network.lan.proto='static'
+        uci set network.lan.ipaddr='192.168.1.88'
+        uci set network.lan.netmask='255.255.255.0'
+        uci set network.lan.gateway='192.168.1.1'
+        uci set network.lan.dns='192.168.1.1'
+        uci set dhcp.lan.ignore='1'
+        uci commit
+        EOF
+        
+        make defconfig
+
+    - name: 5. 下载软件包
+      run: |
+        cd openwrt
+        make download -j8
+
+    - name: 6. 运行编译
+      id: compile
+      run: |
+        cd openwrt
+        make -j$(nproc) || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: 7. 整理固件文件
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE_DIR=$PWD" >> $GITHUB_ENV
+
+    - name: 8. 上传固件到 Release
+      uses: softprops/action-gh-release@v1
+      if: env.FIRMWARE_DIR != ''
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: Build-${{ github.run_id }}
+        files: ${{ env.FIRMWARE_DIR }}/*
