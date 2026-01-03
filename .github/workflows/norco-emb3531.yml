@@ -1,0 +1,132 @@
+name: Norco-EMB3531-RK3399-Pro-SideRouter
+
+on:
+  workflow_dispatch:
+
+permissions: write-all
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: master
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 1. Checkout Code
+        uses: actions/checkout@v3
+
+      - name: 2. Prepare Environment
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup
+          sudo docker image prune -a -f
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install $(curl -fsSL https://is.gd/depends_ubuntu_2204) \
+          python3-pyelftools dwarves clang llvm swig libelf-dev python3-setuptools
+          sudo -E apt-get -qq autoremove --purge
+          sudo -E apt-get -qq clean
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: 3. Clone Source & Clean Feeds
+        run: |
+          git clone $REPO_URL -b $REPO_BRANCH openwrt
+          cd openwrt
+          echo "src-git kenzo https://github.com/kenzok8/openwrt-packages" >> feeds.conf.default
+          echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
+          ./scripts/feeds update -a
+          # 彻底清除重复包防止 Error 2
+          find feeds/luci/applications/ -name "luci-app-mosdns" -type d | xargs rm -rf
+          find feeds/packages/net/ -name "mosdns" -type d | xargs rm -rf
+          find feeds/luci/themes/ -name "luci-theme-argon" -type d | xargs rm -rf
+          ./scripts/feeds install -a
+
+      - name: 4. Patch Kernel Source (PCIe 2.0s Timeout)
+        run: |
+          cd openwrt
+          find target/linux/rockchip -name "pcie-rockchip-host.c" -exec sed -i 's/500 \* USEC_PER_MSEC/2000 \* USEC_PER_MSEC/g' {} +
+          find target/linux/rockchip -name "pcie-rockchip-host.c" -exec sed -i 's/RK_PCIE_LINK_UP_TIMEOUT_MS	500/RK_PCIE_LINK_UP_TIMEOUT_MS	2000/g' {} +
+
+      - name: 5. Inject EMB-3531 DTS
+        run: |
+          cd openwrt
+          mkdir -p target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/
+          cat > target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/rk3399-emb-3531.dts <<EOF
+          /dts-v1/;
+          #include "rk3399-nanopi-r4s.dts"
+          / {
+              model = "Norco EMB-3531 SideGateway";
+              compatible = "rockchip,rk3399-emb-3531", "rockchip,rk3399";
+              vcc3v3_pcie: vcc3v3-pcie-regulator {
+                  compatible = "regulator-fixed";
+                  enable-active-high;
+                  gpio = <&gpio1 17 0>; 
+                  regulator-name = "vcc3v3_pcie";
+                  regulator-always-on;
+                  regulator-boot-on;
+              };
+          };
+          &pcie0 {
+              ep-gpios = <&gpio4 25 0>; 
+              vpcie3v3-supply = <&vcc3v3_pcie>;
+              status = "okay";
+          };
+          EOF
+          [ -f target/linux/rockchip/image/armv8.mk ] && sed -i '/rk3399-nanopi-r4s/a \	rk3399-emb-3531.dtb \\' target/linux/rockchip/image/armv8.mk
+
+      - name: 6. SideGateway Pre-Config (192.168.1.88)
+        run: |
+          cd openwrt
+          mkdir -p package/base-files/files/etc/uci-defaults
+          cat > package/base-files/files/etc/uci-defaults/99-setup <<EOF
+          uci set network.lan.proto='static'
+          uci set network.lan.ipaddr='192.168.1.88'
+          uci set network.lan.netmask='255.255.255.0'
+          uci set network.lan.gateway='192.168.1.1'
+          uci set network.lan.dns='192.168.1.1'
+          uci set dhcp.lan.ignore='1'
+          uci set firewall.@defaults[0].forward='ACCEPT'
+          echo "net.bridge.bridge-nf-call-iptables = 0" >> /etc/sysctl.conf
+          uci commit
+          EOF
+
+      - name: 7. Configuration Setup (RK3399 + DAE)
+        run: |
+          cd openwrt
+          echo "CONFIG_TARGET_rockchip=y" >> .config
+          echo "CONFIG_TARGET_rockchip_armv8=y" >> .config
+          echo "CONFIG_TARGET_rockchip_armv8_DEVICE_rockchip_firefly-rk3399=y" >> .config
+          echo "CONFIG_TARGET_KERNEL_PARTSIZE=128" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=2048" >> .config
+          echo "CONFIG_PACKAGE_luci-app-daed=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
+          echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
+          echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
+          echo "CONFIG_BPF_SYSCALL=y" >> .config
+          echo "CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y" >> .config
+          make defconfig
+
+      - name: 8. Start Compilation
+        id: compile
+        run: |
+          cd openwrt
+          make download -j16
+          make -j$(nproc) || make -j1 V=s
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: 9. Upload Release
+        uses: softprops/action-gh-release@v1
+        if: steps.compile.outputs.status == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: EMB-3531-RK3399-FINAL
+          body: |
+            华北工控 Norco EMB-3531 RK3399 旁路由固件
+            - 修正机型识别错误 (firefly-rk3399 容器)
+            - 修复 PCIe RTL8125B 延时 (2.0s) 与电源管理
+            - 预设 IP: 192.168.1.88 / 无 DHCP
+            - 集成 daed (sing-box), MosDNS, Argon
+          files: openwrt/bin/targets/rockchip/armv8/*.img.gz
