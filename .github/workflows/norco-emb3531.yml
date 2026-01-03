@@ -24,25 +24,24 @@ jobs:
           sudo docker image prune -a -f
           sudo -E apt-get -qq update
           sudo -E apt-get -qq install $(curl -fsSL https://is.gd/depends_ubuntu_2204) \
-          python3-pyelftools dwarves clang llvm swig libelf-dev python3-setuptools
+          python3-pyelftools dwarves clang llvm swig libelf-dev python3-setuptools bc
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
           sudo timedatectl set-timezone "$TZ"
 
-      - name: 3. Clone Source & Clean Feeds
+      - name: 3. Clone Source & Sync Feeds
         run: |
           git clone $REPO_URL -b $REPO_BRANCH openwrt
           cd openwrt
           echo "src-git kenzo https://github.com/kenzok8/openwrt-packages" >> feeds.conf.default
           echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
           ./scripts/feeds update -a
-          # 彻底清除重复包防止 Error 2
-          find feeds/luci/applications/ -name "luci-app-mosdns" -type d | xargs rm -rf
-          find feeds/packages/net/ -name "mosdns" -type d | xargs rm -rf
-          find feeds/luci/themes/ -name "luci-theme-argon" -type d | xargs rm -rf
+          # 精准去重：仅删除可能导致重复定义的界面包
+          rm -rf feeds/luci/applications/luci-app-mosdns
+          rm -rf feeds/luci/themes/luci-theme-argon
           ./scripts/feeds install -a
 
-      - name: 4. Patch Kernel Source (PCIe 2.0s Timeout)
+      - name: 4. PCIe 2.0s Timeout Patch
         run: |
           cd openwrt
           find target/linux/rockchip -name "pcie-rockchip-host.c" -exec sed -i 's/500 \* USEC_PER_MSEC/2000 \* USEC_PER_MSEC/g' {} +
@@ -75,7 +74,7 @@ jobs:
           EOF
           [ -f target/linux/rockchip/image/armv8.mk ] && sed -i '/rk3399-nanopi-r4s/a \	rk3399-emb-3531.dtb \\' target/linux/rockchip/image/armv8.mk
 
-      - name: 6. SideGateway Pre-Config (192.168.1.88)
+      - name: 6. SideGateway Setup (IP 1.88)
         run: |
           cd openwrt
           mkdir -p package/base-files/files/etc/uci-defaults
@@ -91,21 +90,32 @@ jobs:
           uci commit
           EOF
 
-      - name: 7. Configuration Setup (RK3399 + DAE)
+      - name: 7. Final Configuration Setup (Solve Conflicts)
         run: |
           cd openwrt
           echo "CONFIG_TARGET_rockchip=y" >> .config
           echo "CONFIG_TARGET_rockchip_armv8=y" >> .config
           echo "CONFIG_TARGET_rockchip_armv8_DEVICE_rockchip_firefly-rk3399=y" >> .config
-          echo "CONFIG_TARGET_KERNEL_PARTSIZE=128" >> .config
-          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=2048" >> .config
-          echo "CONFIG_PACKAGE_luci-app-daed=y" >> .config
+          
+          # 核心插件：显式开启 mosdns 及其界面
+          echo "CONFIG_PACKAGE_mosdns=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-daed=y" >> .config
           echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-ttyd=y" >> .config
+          
+          # 【冲突修复】：不选冲突的 geoip/geosite，改选统一的 geodata 解决 APK 报错
+          echo "# CONFIG_PACKAGE_v2ray-geoip is not set" >> .config
+          echo "# CONFIG_PACKAGE_v2ray-geosite is not set" >> .config
+          echo "CONFIG_PACKAGE_v2ray-geodata=y" >> .config
+          
+          # 分区空间与 BTF
+          echo "CONFIG_TARGET_KERNEL_PARTSIZE=128" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=2048" >> .config
           echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
           echo "CONFIG_BPF_SYSCALL=y" >> .config
           echo "CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y" >> .config
+          
           make defconfig
 
       - name: 8. Start Compilation
@@ -122,11 +132,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: EMB-3531-RK3399-FINAL
+          tag_name: EMB-3531-STABLE-${{ github.run_id }}
           body: |
-            华北工控 Norco EMB-3531 RK3399 旁路由固件
-            - 修正机型识别错误 (firefly-rk3399 容器)
-            - 修复 PCIe RTL8125B 延时 (2.0s) 与电源管理
-            - 预设 IP: 192.168.1.88 / 无 DHCP
-            - 集成 daed (sing-box), MosDNS, Argon
+            已解决 APK 包管理器冲突和 MosDNS 依赖缺失问题。
           files: openwrt/bin/targets/rockchip/armv8/*.img.gz
